@@ -1,0 +1,55 @@
+import pandas as pd
+import numpy as np
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+import mca
+
+def split_features(df):
+    num_cols = [col for col in df.columns if pd.api.types.is_numeric_dtype(df[col])]
+    cat_cols = [col for col in df.columns if not pd.api.types.is_numeric_dtype(df[col])]
+    return num_cols, cat_cols
+
+def fit_transform_pca(df_num, n_components=2):
+    scaler = StandardScaler()
+    X_num = scaler.fit_transform(df_num)
+    pca = PCA(n_components=n_components)
+    pca_features = pca.fit_transform(X_num)
+    return pca_features, scaler, pca
+
+def fit_transform_mca(df_cat, n_components=2):
+    # mca.MCA的ncols設為要保留的主成分數
+    mca_model = mca.MCA(df_cat, ncols=n_components)
+    mca_features = mca_model.fs_r(N=len(df_cat))
+    return mca_features, mca_model
+
+def combine_features(pca_features, mca_features):
+    # 水平合併降維後的特徵
+    return np.hstack([pca_features, mca_features])
+
+# ==== 使用範例 ====
+if __name__ == "__main__":
+    # 隨機建立範例資料
+    np.random.seed(123)
+    df = pd.DataFrame({
+        'age': np.random.randint(20, 60, 100),
+        'income': np.random.normal(50000, 10000, 100),
+        'gender': np.random.choice(['M', 'F'], 100),
+        'city': np.random.choice([f'城市{i}' for i in range(6)], 100)
+    })
+
+    num_cols, cat_cols = split_features(df)
+    
+    # 數值資料（PCA處理）
+    pca_features, scaler, pca_model = fit_transform_pca(df[num_cols], n_components=2)
+
+    # 類別資料（MCA處理）
+    mca_features, mca_model = fit_transform_mca(df[cat_cols], n_components=2)
+
+    # 合併降維後特徵
+    mixed_features = combine_features(pca_features, mca_features)
+    mixed_features = pd.DataFrame(
+        mixed_features,
+        columns=[f"PCA_{i+1}" for i in range(pca_features.shape[1])] +
+                [f"MCA_{i+1}" for i in range(mca_features.shape[1])]
+    )
+    print(mixed_features.head())
