@@ -1,0 +1,160 @@
+import pandas as pd
+import numpy as np
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+import mca
+
+class HybridFAMD:
+    """
+    混合FAMD實作：
+    - 數值變數：標準化後使用PCA
+    - 低基數類別變數（≤3）：獨熱編碼後與數值變數一起進入PCA
+    - 高基數類別變數（>3）：使用MCA獨立處理
+    """
+    
+    def __init__(self, n_components=5, cardinality_threshold=3):
+        """
+        參數:
+        - n_components: 最終輸出的主成分數量
+        - cardinality_threshold: 類別變數基數門檻，≤此值使用編碼，>此值使用MCA
+        """
+        self.n_components = n_components
+        self.cardinality_threshold = cardinality_threshold
+        self.numerical_cols = []
+        self.low_card_cat_cols = []
+        self.high_card_cat_cols = []
+        self.scaler = StandardScaler()
+        self.pca = None
+        self.mca_model = None
+        
+    def _categorize_features(self, df):
+        """將特徵分類為數值、低基數類別、高基數類別"""
+        for col in df.columns:
+            if pd.api.types.is_numeric_dtype(df[col]):
+                self.numerical_cols.append(col)
+            else:
+                cardinality = df[col].nunique()
+                if cardinality <= self.cardinality_threshold:
+                    self.low_card_cat_cols.append(col)
+                else:
+                    self.high_card_cat_cols.append(col)
+        
+        print(f"數值變數 ({len(self.numerical_cols)}): {self.numerical_cols}")
+        print(f"低基數類別變數 ({len(self.low_card_cat_cols)}): {self.low_card_cat_cols}")
+        print(f"高基數類別變數 ({len(self.high_card_cat_cols)}): {self.high_card_cat_cols}")
+    
+    def fit(self, df):
+        """訓練混合FAMD模型"""
+        # 1. 特徵分類
+        self._categorize_features(df)
+        
+        # 2. 處理數值變數和低基數類別變數（PCA路徑）
+        pca_features = []
+        
+        # 2.1 數值變數標準化
+        if self.numerical_cols:
+            numerical_data = df[self.numerical_cols].values
+            numerical_scaled = self.scaler.fit_transform(numerical_data)
+            pca_features.append(numerical_scaled)
+        
+        # 2.2 低基數類別變數獨熱編碼
+        if self.low_card_cat_cols:
+            low_card_encoded = pd.get_dummies(
+                df[self.low_card_cat_cols], 
+                drop_first=False,
+                dtype=float
+            )
+            self.low_card_encoded_cols = low_card_encoded.columns
+            pca_features.append(low_card_encoded.values)
+        
+        # 2.3 合併後進行PCA
+        if pca_features:
+            pca_data = np.hstack(pca_features)
+            n_pca_components = min(self.n_components, pca_data.shape[1])
+            self.pca = PCA(n_components=n_pca_components)
+            self.pca.fit(pca_data)
+            print(f"\nPCA解釋變異量: {self.pca.explained_variance_ratio_.sum():.2%}")
+        
+        # 3. 處理高基數類別變數（MCA路徑）
+        if self.high_card_cat_cols:
+            high_card_data = df[self.high_card_cat_cols]
+            n_mca_components = min(self.n_components, len(self.high_card_cat_cols))
+            self.mca_model = mca.MCA(high_card_data, ncols=n_mca_components)
+            print(f"\nMCA累積慣性貢獻: {self.mca_model.L.sum():.2%}")
+        
+        return self
+    
+    def transform(self, df):
+        """將數據轉換到低維空間"""
+        components = []
+        
+        # 1. PCA路徑
+        if self.pca is not None:
+            pca_features = []
+            
+            if self.numerical_cols:
+                numerical_scaled = self.scaler.transform(df[self.numerical_cols].values)
+                pca_features.append(numerical_scaled)
+            
+            if self.low_card_cat_cols:
+                low_card_encoded = pd.get_dummies(
+                    df[self.low_card_cat_cols],
+                    drop_first=False,
+                    dtype=float
+                )
+                # 確保編碼欄位與訓練時一致
+                low_card_encoded = low_card_encoded.reindex(
+                    columns=self.low_card_encoded_cols, 
+                    fill_value=0
+                )
+                pca_features.append(low_card_encoded.values)
+            
+            pca_data = np.hstack(pca_features)
+            pca_transformed = self.pca.transform(pca_data)
+            components.append(pca_transformed)
+        
+        # 2. MCA路徑
+        if self.mca_model is not None:
+            high_card_data = df[self.high_card_cat_cols]
+            mca_transformed = self.mca_model.fs_r(N=len(high_card_data))
+            components.append(mca_transformed)
+        
+        # 3. 合併所有主成分
+        if components:
+            result = np.hstack(components)
+            # 限制最終輸出維度
+            result = result[:, :self.n_components]
+            return pd.DataFrame(
+                result,
+                columns=[f'Component_{i+1}' for i in range(result.shape[1])],
+                index=df.index
+            )
+        else:
+            raise ValueError("沒有可用的特徵進行轉換")
+    
+    def fit_transform(self, df):
+        """訓練並轉換數據"""
+        self.fit(df)
+        return self.transform(df)
+
+
+# 使用範例
+if __name__ == "__main__":
+    # 建立範例數據
+    np.random.seed(42)
+    sample_data = pd.DataFrame({
+        'age': np.random.randint(20, 70, 100),
+        'income': np.random.normal(50000, 15000, 100),
+        'gender': np.random.choice(['M', 'F'], 100),  # 基數=2 (低基數)
+        'education': np.random.choice(['高中', '大學', '研究所'], 100),  # 基數=3 (低基數)
+        'city': np.random.choice([f'城市{i}' for i in range(10)], 100),  # 基數=10 (高基數)
+        'occupation': np.random.choice([f'職業{i}' for i in range(15)], 100)  # 基數=15 (高基數)
+    })
+    
+    # 執行混合FAMD
+    hybrid_famd = HybridFAMD(n_components=5, cardinality_threshold=3)
+    result = hybrid_famd.fit_transform(sample_data)
+    
+    print("\n轉換後的資料形狀:", result.shape)
+    print("\n前5筆資料:")
+    print(result.head())
