@@ -1,0 +1,46 @@
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+
+def scheme3_pca_with_onehot(df, n_components=5):
+    # 分類數值變數及類別變數
+    num_cols = [col for col in df.columns if pd.api.types.is_numeric_dtype(df[col])]
+    cat_cols = [col for col in df.columns if not pd.api.types.is_numeric_dtype(df[col])]
+
+    # 數值變數標準化
+    if num_cols:
+        X_num = df[num_cols].astype(float)
+        scaler = StandardScaler()
+        X_num_scaled = scaler.fit_transform(X_num)
+        X_num_scaled = pd.DataFrame(X_num_scaled, columns=num_cols, index=df.index)
+    else:
+        X_num_scaled = pd.DataFrame(index=df.index)
+
+    # 類別變數全部做One-Hot encoding
+    if cat_cols:
+        X_cat = pd.get_dummies(df[cat_cols], drop_first=False, dtype=float)
+    else:
+        X_cat = pd.DataFrame(index=df.index)
+    
+    # 合併所有特徵
+    X = pd.concat([X_num_scaled, X_cat], axis=1)
+
+    # PCA
+    n_pca_components = min(n_components, X.shape[1])
+    pca = PCA(n_components=n_pca_components)
+    X_pca = pca.fit_transform(X)
+    columns = [f"PC{i+1}" for i in range(n_pca_components)]
+    return pd.DataFrame(X_pca, columns=columns, index=df.index)
+
+# ==== 使用範例 ====
+if __name__ == "__main__":
+    np.random.seed(42)
+    df = pd.DataFrame({
+        'age': np.random.randint(20, 60, 100),
+        'income': np.random.normal(50000, 10000, 100),
+        'gender': np.random.choice(['M', 'F'], 100),
+        'city': np.random.choice([f'城市{i}' for i in range(6)], 100)
+    })
+    result = scheme3_pca_with_onehot(df, n_components=5)
+    print(result.head())
