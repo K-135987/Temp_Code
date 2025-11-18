@@ -1,0 +1,316 @@
+import pandas as pd
+import numpy as np
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+
+def manual_mca(df_cat, n_components=2):
+    '''
+    手動實作MCA（多重對應分析）
+    
+    參數:
+    - df_cat: 包含類別變數的DataFrame
+    - n_components: 要提取的主成分數量
+    
+    回傳:
+    - row_coords: 列座標（觀察值在降維空間的位置）
+    - col_coords: 欄座標（類別在降維空間的位置）
+    - eigenvalues: 特徵值（慣性）
+    '''
+    
+    # 1. 建立指標矩陣（Indicator Matrix）
+    indicator_matrix = pd.get_dummies(df_cat, drop_first=False, dtype=float)
+    Z = indicator_matrix.values
+    n = Z.shape[0]  # 觀察值數量
+    
+    # 2. 計算列總和和欄總和
+    row_sums = Z.sum(axis=1, keepdims=True)  # 每列的總和
+    col_sums = Z.sum(axis=0, keepdims=True)  # 每欄的總和
+    total_sum = Z.sum()  # 總和
+    
+    # 3. 計算期望矩陣和殘差矩陣
+    expected = np.dot(row_sums, col_sums) / total_sum
+    residuals = Z - expected
+    
+    # 4. 標準化殘差矩陣（對應分析的核心步驟）
+    # 除以列總和和欄總和的平方根
+    row_sqrt_inv = 1.0 / np.sqrt(row_sums.ravel())
+    col_sqrt_inv = 1.0 / np.sqrt(col_sums.ravel())
+    
+    # 建立對角矩陣的逆
+    D_r_sqrt_inv = np.diag(row_sqrt_inv)
+    D_c_sqrt_inv = np.diag(col_sqrt_inv)
+    
+    # 標準化的對應分析矩陣
+    S = D_r_sqrt_inv @ residuals @ D_c_sqrt_inv
+    
+    # 5. 執行SVD分解
+    U, singular_values, Vt = np.linalg.svd(S, full_matrices=False)
+    
+    # 6. 計算特徵值（慣性）
+    eigenvalues = singular_values ** 2
+    
+    # 7. 計算主座標
+    # 列座標（觀察值）
+    n_comp = min(n_components, len(singular_values))
+    F = D_r_sqrt_inv @ U[:, :n_comp] @ np.diag(singular_values[:n_comp])
+    
+    # 欄座標（類別）
+    G = D_c_sqrt_inv @ Vt.T[:, :n_comp] @ np.diag(singular_values[:n_comp])
+    
+    # 儲存相關資訊供transform使用
+    mca_info = {
+        'indicator_cols': indicator_matrix.columns,
+        'col_sums': col_sums,
+        'total_sum': total_sum,
+        'col_sqrt_inv': col_sqrt_inv,
+        'Vt': Vt,
+        'singular_values': singular_values,
+        'n_components': n_comp
+    }
+    
+    return F, G, eigenvalues[:n_comp], mca_info
+
+
+def transform_manual_mca(df_cat, mca_info):
+    '''
+    使用訓練好的MCA模型轉換新數據
+    
+    參數:
+    - df_cat: 包含類別變數的DataFrame
+    - mca_info: manual_mca回傳的資訊字典
+    
+    回傳:
+    - 轉換後的座標
+    '''
+    # 建立指標矩陣
+    indicator_matrix = pd.get_dummies(df_cat, drop_first=False, dtype=float)
+    # 確保欄位與訓練時一致
+    indicator_matrix = indicator_matrix.reindex(
+        columns=mca_info['indicator_cols'], 
+        fill_value=0
+    )
+    Z = indicator_matrix.values
+    
+    # 計算行座標
+    row_sums = Z.sum(axis=1, keepdims=True)
+    row_sqrt_inv = 1.0 / np.sqrt(row_sums.ravel())
+    D_r_sqrt_inv = np.diag(row_sqrt_inv)
+    
+    # 投影到因子空間
+    D_c_sqrt_inv = np.diag(mca_info['col_sqrt_inv'])
+    n_comp = mca_info['n_components']
+    
+    # 標準化並投影
+    S_new = D_r_sqrt_inv @ (Z - np.dot(row_sums, mca_info['col_sums']) / mca_info['total_sum']) @ D_c_sqrt_inv
+    F_new = S_new @ mca_info['Vt'].T[:, :n_comp] @ np.diag(mca_info['singular_values'][:n_comp])
+    
+    return F_new
+
+
+def categorize_features(df, cardinality_threshold=3):
+    '''將特徵分類為數值、低基數類別、高基數類別'''
+    numerical_cols = []
+    low_card_cat_cols = []
+    high_card_cat_cols = []
+    
+    for col in df.columns:
+        if pd.api.types.is_numeric_dtype(df[col]):
+            numerical_cols.append(col)
+        else:
+            cardinality = df[col].nunique()
+            if cardinality <= cardinality_threshold:
+                low_card_cat_cols.append(col)
+            else:
+                high_card_cat_cols.append(col)
+    
+    print(f"數值變數 ({len(numerical_cols)}): {numerical_cols}")
+    print(f"低基數類別變數 ({len(low_card_cat_cols)}): {low_card_cat_cols}")
+    print(f"高基數類別變數 ({len(high_card_cat_cols)}): {high_card_cat_cols}")
+    
+    return numerical_cols, low_card_cat_cols, high_card_cat_cols
+
+
+def fit_hybrid_famd_no_mca_package(df, n_components=5, cardinality_threshold=3):
+    '''
+    訓練混合FAMD模型（不使用mca套件）
+    
+    參數:
+    - df: 輸入數據框
+    - n_components: 最終輸出的主成分數量
+    - cardinality_threshold: 類別變數基數門檻
+    
+    回傳:
+    - fitted_objects: 包含所有訓練好的模型和資訊的字典
+    '''
+    # 1. 特徵分類
+    numerical_cols, low_card_cat_cols, high_card_cat_cols = categorize_features(
+        df, cardinality_threshold
+    )
+    
+    fitted_objects = {
+        'numerical_cols': numerical_cols,
+        'low_card_cat_cols': low_card_cat_cols,
+        'high_card_cat_cols': high_card_cat_cols,
+        'n_components': n_components,
+        'scaler': None,
+        'pca': None,
+        'mca_info': None,
+        'low_card_encoded_cols': None
+    }
+    
+    # 2. 處理數值變數和低基數類別變數（PCA路徑）
+    pca_features = []
+    
+    # 2.1 數值變數標準化
+    if numerical_cols:
+        scaler = StandardScaler()
+        numerical_data = df[numerical_cols].values
+        numerical_scaled = scaler.fit_transform(numerical_data)
+        pca_features.append(numerical_scaled)
+        fitted_objects['scaler'] = scaler
+    
+    # 2.2 低基數類別變數獨熱編碼
+    if low_card_cat_cols:
+        low_card_encoded = pd.get_dummies(
+            df[low_card_cat_cols], 
+            drop_first=False,
+            dtype=float
+        )
+        fitted_objects['low_card_encoded_cols'] = low_card_encoded.columns
+        pca_features.append(low_card_encoded.values)
+    
+    # 2.3 合併後進行PCA
+    if pca_features:
+        pca_data = np.hstack(pca_features)
+        n_pca_components = min(n_components, pca_data.shape[1])
+        pca_model = PCA(n_components=n_pca_components)
+        pca_model.fit(pca_data)
+        fitted_objects['pca'] = pca_model
+        print(f"\nPCA解釋變異量: {pca_model.explained_variance_ratio_.sum():.2%}")
+    
+    # 3. 處理高基數類別變數（手動MCA路徑）
+    if high_card_cat_cols:
+        high_card_data = df[high_card_cat_cols]
+        n_mca_components = min(n_components, len(high_card_cat_cols) * 2)
+        
+        # 使用手動實作的MCA
+        row_coords, col_coords, eigenvalues, mca_info = manual_mca(
+            high_card_data, 
+            n_components=n_mca_components
+        )
+        
+        fitted_objects['mca_info'] = mca_info
+        fitted_objects['mca_eigenvalues'] = eigenvalues
+        
+        # 計算解釋的慣性比例
+        total_inertia = eigenvalues.sum()
+        explained_inertia = eigenvalues[:n_mca_components].sum() / total_inertia if total_inertia > 0 else 0
+        print(f"MCA累積慣性貢獻: {explained_inertia:.2%}")
+    
+    return fitted_objects
+
+
+def transform_hybrid_famd_no_mca_package(df, fitted_objects):
+    '''
+    將數據轉換到低維空間（不使用mca套件）
+    
+    參數:
+    - df: 輸入數據框
+    - fitted_objects: fit_hybrid_famd_no_mca_package回傳的字典
+    
+    回傳:
+    - 降維後的DataFrame
+    '''
+    components = []
+    
+    numerical_cols = fitted_objects['numerical_cols']
+    low_card_cat_cols = fitted_objects['low_card_cat_cols']
+    high_card_cat_cols = fitted_objects['high_card_cat_cols']
+    n_components = fitted_objects['n_components']
+    
+    # 1. PCA路徑
+    if fitted_objects['pca'] is not None:
+        pca_features = []
+        
+        # 數值變數
+        if numerical_cols:
+            numerical_scaled = fitted_objects['scaler'].transform(df[numerical_cols].values)
+            pca_features.append(numerical_scaled)
+        
+        # 低基數類別變數
+        if low_card_cat_cols:
+            low_card_encoded = pd.get_dummies(
+                df[low_card_cat_cols],
+                drop_first=False,
+                dtype=float
+            )
+            low_card_encoded = low_card_encoded.reindex(
+                columns=fitted_objects['low_card_encoded_cols'], 
+                fill_value=0
+            )
+            pca_features.append(low_card_encoded.values)
+        
+        pca_data = np.hstack(pca_features)
+        pca_transformed = fitted_objects['pca'].transform(pca_data)
+        components.append(pca_transformed)
+    
+    # 2. MCA路徑（手動實作）
+    if fitted_objects['mca_info'] is not None:
+        high_card_data = df[high_card_cat_cols]
+        mca_transformed = transform_manual_mca(high_card_data, fitted_objects['mca_info'])
+        components.append(mca_transformed)
+    
+    # 3. 合併所有主成分
+    if components:
+        result = np.hstack(components)
+        result = result[:, :n_components]
+        return pd.DataFrame(
+            result,
+            columns=[f'Component_{i+1}' for i in range(result.shape[1])],
+            index=df.index
+        )
+    else:
+        raise ValueError("沒有可用的特徵進行轉換")
+
+
+def fit_transform_hybrid_famd_no_mca_package(df, n_components=5, cardinality_threshold=3):
+    '''
+    訓練並轉換數據（不使用mca套件）
+    
+    參數:
+    - df: 輸入數據框
+    - n_components: 最終輸出的主成分數量
+    - cardinality_threshold: 類別變數基數門檻
+    
+    回傳:
+    - transformed_df: 降維後的DataFrame
+    - fitted_objects: 訓練好的模型物件
+    '''
+    fitted_objects = fit_hybrid_famd_no_mca_package(df, n_components, cardinality_threshold)
+    transformed_df = transform_hybrid_famd_no_mca_package(df, fitted_objects)
+    return transformed_df, fitted_objects
+
+
+# ===== 使用範例 =====
+if __name__ == "__main__":
+    # 建立範例數據
+    np.random.seed(42)
+    sample_data = pd.DataFrame({
+        'age': np.random.randint(20, 70, 100),
+        'income': np.random.normal(50000, 15000, 100),
+        'gender': np.random.choice(['M', 'F'], 100),
+        'education': np.random.choice(['高中', '大學', '研究所'], 100),
+        'city': np.random.choice([f'城市{i}' for i in range(10)], 100),
+        'occupation': np.random.choice([f'職業{i}' for i in range(15)], 100)
+    })
+    
+    # 執行混合FAMD（不使用mca套件）
+    result, fitted_objects = fit_transform_hybrid_famd_no_mca_package(
+        sample_data, 
+        n_components=5, 
+        cardinality_threshold=3
+    )
+    
+    print("\n轉換後的資料形狀:", result.shape)
+    print("\n前5筆資料:")
+    print(result.head())
