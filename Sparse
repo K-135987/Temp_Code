@@ -1,0 +1,84 @@
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import OneHotEncoder
+from scipy.sparse import hstack, csr_matrix
+from sklearn.decomposition import PCA, TruncatedSVD
+from sklearn.preprocessing import StandardScaler
+
+def fit_transform_manual_mca_sparse(df_cat, n_components=2):
+    '''
+    使用稀疏矩陣實作MCA，避免記憶體溢出
+    '''
+    # 1. 使用OneHotEncoder建立稀疏指標矩陣
+    encoder = OneHotEncoder(sparse_output=True, dtype=np.float32)
+    Z_sparse = encoder.fit_transform(df_cat)
+    n = Z_sparse.shape[0]
+    
+    # 2. 計算列總和和欄總和（使用稀疏矩陣運算）
+    row_sums = np.array(Z_sparse.sum(axis=1)).ravel()
+    col_sums = np.array(Z_sparse.sum(axis=0)).ravel()
+    total_sum = Z_sparse.sum()
+    
+    # 3. 標準化（使用稀疏矩陣格式）
+    row_sqrt_inv = 1.0 / np.sqrt(row_sums)
+    col_sqrt_inv = 1.0 / np.sqrt(col_sums)
+    
+    # 建立對角矩陣（稀疏格式）
+    from scipy.sparse import diags
+    D_r_sqrt_inv = diags(row_sqrt_inv)
+    D_c_sqrt_inv = diags(col_sqrt_inv)
+    
+    # 計算期望並標準化
+    expected_sparse = csr_matrix((row_sums[:, None] @ col_sums[None, :]) / total_sum)
+    residuals = Z_sparse - expected_sparse
+    S = D_r_sqrt_inv @ residuals @ D_c_sqrt_inv
+    
+    # 4. 使用TruncatedSVD代替完整SVD（專為稀疏矩陣優化）
+    svd = TruncatedSVD(n_components=n_components, random_state=42)
+    F = svd.fit_transform(S)
+    
+    # 儲存轉換資訊
+    mca_info = {
+        'encoder': encoder,
+        'row_sqrt_inv': row_sqrt_inv,
+        'col_sqrt_inv': col_sqrt_inv,
+        'col_sums': col_sums,
+        'total_sum': total_sum,
+        'svd': svd
+    }
+    
+    return F, mca_info
+
+def split_features(df):
+    num_cols = [col for col in df.columns if pd.api.types.is_numeric_dtype(df[col])]
+    cat_cols = [col for col in df.columns if not pd.api.types.is_numeric_dtype(df[col])]
+    return num_cols, cat_cols
+
+def fit_transform_pca(df_num, n_components=2):
+    scaler = StandardScaler()
+    X_num = scaler.fit_transform(df_num)
+    pca = PCA(n_components=n_components)
+    pca_features = pca.fit_transform(X_num)
+    return pca_features, scaler, pca
+
+# ==== 使用範例 ====
+if __name__ == "__main__":
+    np.random.seed(42)
+    df = pd.DataFrame({
+        'age': np.random.randint(20, 60, 100),
+        'income': np.random.normal(50000, 10000, 100),
+        'gender': np.random.choice(['M', 'F'], 100),
+        'city': np.random.choice([f'城市{i}' for i in range(50)], 100)  # 高基數
+    })
+
+    num_cols, cat_cols = split_features(df)
+    pca_features, scaler, pca_model = fit_transform_pca(df[num_cols], n_components=2)
+    mca_features, mca_info = fit_transform_manual_mca_sparse(df[cat_cols], n_components=2)
+
+    mixed_features = np.hstack([pca_features, mca_features])
+    result = pd.DataFrame(
+        mixed_features,
+        columns=[f"PCA_{i+1}" for i in range(pca_features.shape[1])] +
+                [f"MCA_{i+1}" for i in range(mca_features.shape[1])]
+    )
+    print(result.head())
